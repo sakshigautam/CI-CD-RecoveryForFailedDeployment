@@ -1,0 +1,153 @@
+
+name: CI-CD-Rollback-Demo
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  DEPLOYMENT_NAME: rollback-demo
+  CONTAINER_NAME: app
+  NAMESPACE: default
+
+jobs:
+  ci:
+    name: CI - Build and Push
+    runs-on: ubuntu-latest
+
+    outputs:
+      image: ${{ steps.image.outputs.name }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set image name
+        id: image
+        shell: bash
+        run: |
+          echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push application image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./app
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ github.sha }}
+
+  cd:
+    name: CD - Deploy and Rollback
+    runs-on: ubuntu-latest
+    needs: ci
+
+    # Configure KUBE_CONFIG as a GitHub Actions secret.
+    steps:
+      - name: Configure kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Configure Kubernetes access
+        shell: bash
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+        run: |
+          mkdir -p "$HOME/.kube"
+          printf '%s' "$KUBE_CONFIG" |
+            base64 --decode > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+          kubectl cluster-info
+
+      - name: Record current release
+        id: previous
+        shell: bash
+        run: |
+          kubectl rollout status \
+            deployment/${DEPLOYMENT_NAME} \
+            -n "$NAMESPACE" --timeout=60s
+
+          kubectl get deployment "$DEPLOYMENT_NAME" \
+            -n "$NAMESPACE" \
+            -o jsonpath='{.spec.template.spec.containers[?(@.name=="app")].image}'
+
+          echo
+          echo "Previous healthy deployment verified."
+
+      - name: Deploy intentionally broken release
+        id: deploy
+        continue-on-error: true
+        shell: bash
+        env:
+          IMAGE_NAME: ${{ needs.ci.outputs.image }}
+        run: |
+          # This tag is intentionally never built or pushed.
+          BAD_IMAGE="${IMAGE_NAME}:intentionally-bad-${GITHUB_SHA}"
+
+          echo "Deploying intentionally invalid image: $BAD_IMAGE"
+
+          kubectl set image \
+            deployment/${DEPLOYMENT_NAME} \
+            ${CONTAINER_NAME}="$BAD_IMAGE" \
+            -n "$NAMESPACE"
+
+          # Expected to time out because Kubernetes cannot pull the image.
+          kubectl rollout status \
+            deployment/${DEPLOYMENT_NAME} \
+            -n "$NAMESPACE" \
+            --timeout=90s
+
+      - name: Show failure evidence
+        if: steps.deploy.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "Expected failure detected."
+          kubectl get pods -n "$NAMESPACE"
+          kubectl describe deployment "$DEPLOYMENT_NAME" \
+            -n "$NAMESPACE"
+
+      - name: Automatic rollback
+        if: steps.deploy.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "Rolling back to the previous Deployment revision..."
+
+          kubectl rollout undo \
+            deployment/${DEPLOYMENT_NAME} \
+            -n "$NAMESPACE"
+
+          kubectl rollout status \
+            deployment/${DEPLOYMENT_NAME} \
+            -n "$NAMESPACE" \
+            --timeout=120s
+
+          echo "Rollback completed."
+
+      - name: Verify recovery
+        if: steps.deploy.outcome == 'failure'
+        shell: bash
+        run: |
+          kubectl get deployment "$DEPLOYMENT_NAME" \
+            -n "$NAMESPACE"
+
+          kubectl get pods -n "$NAMESPACE"
+
+          kubectl rollout history \
+            deployment/${DEPLOYMENT_NAME} \
+            -n "$NAMESPACE"
+
+      - name: Mark demo as expected rollback
+        if: steps.deploy.outcome == 'failure'
+        run: |
+          echo "SUCCESS: Failed release was detected and rollback ran."
